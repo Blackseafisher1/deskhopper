@@ -58,6 +58,7 @@ DeskHopper is a lightweight, background utility for Windows 10/11 that enhances 
 
 * **Switch to Desktop X**: `Right Ctrl + <Number>` (where `0` maps to desktop 10)
 * **Move Active Window to Desktop X**: `Right Ctrl + Shift + <Number>` (where `0` maps to desktop 10)
+* **Next / Previous Desktop**: `Ctrl + Win + Left/Right Arrow` — overrides Windows' default hotkey for an instant switch without the sluggish animation. Wraps around at the first/last desktop.
 
 ### Running at Startup (Recommended)
 
@@ -67,6 +68,35 @@ To have DeskHopper start automatically when Windows boots up:
 2.  Type `shell:startup` and press Enter. This will open your Startup folder.
 3.  Create a shortcut to `deskhopper.exe` (from your `target/release/` folder).
 4.  Place this shortcut into the Startup folder.
+
+### Running as Administrator (Recommended)
+
+DeskHopper intercepts `Ctrl + Win + Left/Right` with a low-level keyboard hook. Because of Windows' User Interface Privilege Isolation (UIPI), a **non-elevated** DeskHopper cannot see keystrokes while an **elevated** window (e.g. Task Manager) is focused — in that case Windows' default switch takes over. Running DeskHopper elevated fixes this. The `Right Ctrl + <Number>` hotkeys work regardless because they use `RegisterHotKey`.
+
+The recommended way is a Task Scheduler task. You answer the UAC prompt **only once** when the task is created; afterwards DeskHopper starts elevated silently at every logon.
+
+**Option A – current user** (the user running the command must have admin privileges):
+
+```powershell
+schtasks /create /tn "DeskHopper" /tr "C:\full\path\to\deskhopper.exe" /sc onlogon /rl highest /f
+```
+
+**Option B – any user (all users)**, via the Task Scheduler GUI:
+
+1.  `Win + R` → `taskschd.msc`
+2.  Task Scheduler Library → right-click → **Create Task**
+3.  **General** tab: give it a name and check **Run with highest privileges**
+4.  **Triggers** tab → New → Begin the task: **At log on** → select **Any user** (or your user for this user only)
+5.  **Actions** tab → New → Start a program → browse to `deskhopper.exe`, and set **Start in (optional)** to the folder containing `deskhopper.exe` (its working directory)
+6.  **Conditions** tab → uncheck **Start the task only if the computer is on AC power** and **Stop if the computer switches to battery power**
+7.  OK (answer the UAC prompt once)
+
+Notes:
+
+* **Recommended: install the binary to a stable location** instead of pointing the task at a build folder. Create e.g. `C:\Program Files\Deskhopper\`, copy `deskhopper.exe` there, and point the task at that path (set **Start in** to `C:\Program Files\Deskhopper`). Build/target folders can be wiped by rebuilds, which would break the task.
+* `deskhopper.exe` must stay at the configured path.
+* To remove the task later: `schtasks /delete /tn "DeskHopper" /f`
+* The task's XML lives at `C:\Windows\System32\Tasks\DeskHopper` but is system-protected — always edit via the GUI, `schtasks.exe`, or PowerShell.
 
 ## ⚙️ Configuration
 
