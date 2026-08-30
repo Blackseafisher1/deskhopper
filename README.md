@@ -10,6 +10,8 @@ DeskHopper is a lightweight, background utility for Windows 10/11 that enhances 
 * **Move Active Window to Virtual Desktop**: Seamlessly move your currently focused window to a specific virtual desktop.
     * `Right Ctrl + Shift + 1` to `Right Ctrl + Shift + 9` to move the window to desktops 1-9.
     * `Right Ctrl + Shift + 0` to move the window to desktop 10.
+* **Next / Previous Desktop**: `Ctrl + Win + Left/Right Arrow` overrides Windows' default hotkey for an instant switch (no sluggish animation), wrapping around at the first/last desktop.
+* **Move Window to Next / Previous Desktop**: `Ctrl + Alt + Left/Right Arrow` moves the focused window to the previous/next desktop (wraps around).
 * **Smart Focus**: Remembers the last active window on each desktop and attempts to restore focus to it when you switch back.
 * **Background Operation**: Runs silently in the background without a console window.
 * **System Tray Control**:
@@ -59,6 +61,7 @@ DeskHopper is a lightweight, background utility for Windows 10/11 that enhances 
 * **Switch to Desktop X**: `Right Ctrl + <Number>` (where `0` maps to desktop 10)
 * **Move Active Window to Desktop X**: `Right Ctrl + Shift + <Number>` (where `0` maps to desktop 10)
 * **Next / Previous Desktop**: `Ctrl + Win + Left/Right Arrow` — overrides Windows' default hotkey for an instant switch without the sluggish animation. Wraps around at the first/last desktop.
+* **Move Window to Next / Previous Desktop**: `Ctrl + Alt + Left/Right Arrow` — moves the focused window to the previous/next desktop (wraps around).
 
 ### Running at Startup (Recommended)
 

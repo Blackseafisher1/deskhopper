@@ -32,7 +32,7 @@ use winvd::{create_desktop, get_desktop_count, switch_desktop, move_window_to_de
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM, LRESULT, BOOL, TRUE, FALSE, HINSTANCE},
     UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_CONTROL, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN,
+        GetAsyncKeyState, VK_CONTROL, VK_LEFT, VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN,
     },
     UI::WindowsAndMessaging::{
         MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MESSAGEBOX_STYLE, GetForegroundWindow,
@@ -49,6 +49,8 @@ enum CustomEvent {
     HotkeyTriggered(u32),
     PrevDesktop,
     NextDesktop,
+    MoveWindowPrev,
+    MoveWindowNext,
 }
 
 enum HotkeyAction {
@@ -69,6 +71,7 @@ const ICON_BYTES: &[u8] = include_bytes!("../icon.ico");
 static EVENT_PROXY: Mutex<Option<EventLoopProxy<CustomEvent>>> = Mutex::new(None);
 static HOOK_HANDLE: Mutex<Option<usize>> = Mutex::new(None);
 static SWALLOW_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SWALLOW_MOVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 struct EnumCallbackData {
     target_desktop_id: u32,
@@ -254,6 +257,14 @@ fn main() -> Result<()> {
                         info!("Ctrl+Win+Right pressed -> switching to next desktop (wrapping).");
                         handle_switch_wrapping(1, &last_active_windows_map_for_loop);
                     }
+                    CustomEvent::MoveWindowPrev => {
+                        info!("Ctrl+Alt+Left pressed -> moving window to previous desktop (wrapping).");
+                        handle_move_window_wrapping(-1);
+                    }
+                    CustomEvent::MoveWindowNext => {
+                        info!("Ctrl+Alt+Right pressed -> moving window to next desktop (wrapping).");
+                        handle_move_window_wrapping(1);
+                    }
                 }
             }
             _ => (),
@@ -360,6 +371,38 @@ fn handle_switch_wrapping(direction: i64, last_active_map: &LastActiveWindowMap)
             }
         }
         Err(e) => error!("Could not get current desktop for wrapped switch: {:?}", e),
+    }
+}
+
+fn handle_move_window_wrapping(direction: i64) {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0 == std::ptr::null_mut() {
+        error!("Failed to get foreground window handle for wrapped move.");
+        return;
+    }
+
+    match winvd::get_current_desktop() {
+        Ok(d) => {
+            if let Ok(idx) = d.get_index() {
+                let current = idx as i64;
+                let count = get_desktop_count().unwrap_or(1) as i64;
+                if count <= 1 {
+                    return;
+                }
+                let mut target = current + direction;
+                if target < 0 {
+                    target = count - 1;
+                }
+                if target >= count {
+                    target = 0;
+                }
+                match move_window_to_desktop(target as u32, &hwnd) {
+                    Ok(_) => info!("Moved window {:?} to desktop index {} (wrapped).", hwnd, target),
+                    Err(e) => error!("Failed to move window {:?} to desktop index {}: {:?}", hwnd, target, e),
+                }
+            }
+        }
+        Err(e) => error!("Could not get current desktop for wrapped move: {:?}", e),
     }
 }
 
@@ -663,6 +706,7 @@ unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lpa
         let ctrl_down = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
         let win_down = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } as u16 & 0x8000) != 0
             || (unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } as u16 & 0x8000) != 0;
+        let alt_down = (unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } as u16 & 0x8000) != 0;
 
         let is_arrow = vk == VK_LEFT.0 as u32 || vk == VK_RIGHT.0 as u32;
         let msg = wparam.0 as u32;
@@ -683,6 +727,22 @@ unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lpa
             }
             return LRESULT(1);
         }
+
+        if is_arrow && ctrl_down && alt_down && !win_down && is_key_msg {
+            if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+                let was_active = SWALLOW_MOVE_ACTIVE.swap(true, Ordering::SeqCst);
+                if !was_active {
+                    let event = if vk == VK_LEFT.0 as u32 { CustomEvent::MoveWindowPrev } else { CustomEvent::MoveWindowNext };
+                    if let Some(proxy) = EVENT_PROXY.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                        info!("Sending {:?} to event loop.", event);
+                        let _ = proxy.send_event(event);
+                    }
+                }
+            } else {
+                SWALLOW_MOVE_ACTIVE.store(false, Ordering::SeqCst);
+            }
+            return LRESULT(1);
+        }
     }
 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -692,8 +752,10 @@ fn show_about_dialog() {
     let message = format!(
         "{}\nVersion: {}\n\n\
         Allows switching virtual desktops 1-10 using RCtrl + <Number> (RCtrl+0 for Desktop 10).\n\
-        As well as switching to the next and previous desktop via Ctrl + Win + Left/Right Arrow, overriding Windows' default behavior (sluggish animation when animations are on).\n\n\
-        Author: Joona Kulmala <jmkulmala@gmail.com>.",
+        As well as switching to the next and previous desktop via Ctrl + Win + Left/Right Arrow, overriding Windows' default behavior (sluggish animation when animations are on).\n\
+        Move the focused window to the next/previous desktop via Ctrl + Alt + Left/Right Arrow.\n\n\
+        Author: Joona Kulmala <jmkulmala@gmail.com>.\n\n\
+        Contributor(s): Ege Karadeniz <ege.karadeniz@yahoo.com>.",
         APP_NAME,
         env!("CARGO_PKG_VERSION")
     );
