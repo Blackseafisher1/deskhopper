@@ -11,7 +11,7 @@ use global_hotkey::{
 use log::{debug, error, info, warn};
 use std::{
     collections::HashMap, 
-    sync::{Arc, Mutex}, // Added Arc, Mutex for shared state
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, // Added Arc, Mutex, atomic for shared state
     thread, 
     ffi::OsString, 
     os::windows::ffi::OsStringExt
@@ -30,11 +30,16 @@ use tray_icon::{
 use winvd::{create_desktop, get_desktop_count, switch_desktop, move_window_to_desktop, get_desktop_by_window}; 
 
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, BOOL, TRUE, FALSE},
+    Foundation::{HWND, LPARAM, WPARAM, LRESULT, BOOL, TRUE, FALSE, HINSTANCE},
+    UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LEFT, VK_LWIN, VK_RIGHT, VK_RWIN,
+    },
     UI::WindowsAndMessaging::{
         MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MESSAGEBOX_STYLE, GetForegroundWindow,
         IsWindow, IsWindowVisible, GetWindowLongW, GWL_STYLE, BringWindowToTop, SetForegroundWindow, WS_CHILD,
-        EnumWindows, GetWindowTextW,
+        EnumWindows, GetWindowTextW, PeekMessageW, PM_REMOVE, TranslateMessage, DispatchMessageW, HHOOK, MSG,
+        WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_QUIT,
+        CallNextHookEx, KBDLLHOOKSTRUCT, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
     },
 };
 use windows::core::PCWSTR; 
@@ -42,6 +47,8 @@ use windows::core::PCWSTR;
 #[derive(Debug, Clone, Copy)]
 enum CustomEvent {
     HotkeyTriggered(u32),
+    PrevDesktop,
+    NextDesktop,
 }
 
 enum HotkeyAction {
@@ -59,6 +66,10 @@ const APP_NAME: &str = "DeskHopper";
 
 const ICON_BYTES: &[u8] = include_bytes!("../icon.ico");
 
+static EVENT_PROXY: Mutex<Option<EventLoopProxy<CustomEvent>>> = Mutex::new(None);
+static HOOK_HANDLE: Mutex<Option<usize>> = Mutex::new(None);
+static SWALLOW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 struct EnumCallbackData {
     target_desktop_id: u32,
     found_hwnd: Option<HWND>,
@@ -75,9 +86,12 @@ fn load_tray_icon() -> Result<tray_icon::Icon> {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    #[cfg(debug_assertions)]
+    {
+        env_logger::Builder::from_default_env()
+            .filter_level(log::LevelFilter::Info)
+            .init();
+    }
 
     info!("{} starting...", APP_NAME);
 
@@ -133,6 +147,14 @@ fn main() -> Result<()> {
             }
         }
         info!("Hotkey listener thread finished.");
+    });
+
+    // Spawn the low-level keyboard hook thread to override Ctrl+Win+Left/Right
+    let ll_hook_proxy = proxy.clone();
+    thread::spawn(move || {
+        if let Err(e) = setup_low_level_keyboard_hook(ll_hook_proxy) {
+            error!("Failed to set up low-level keyboard hook: {:?}", e);
+        }
     });
 
     info!("Event loop starting. Application is running in the background.");
@@ -200,6 +222,10 @@ fn main() -> Result<()> {
             Event::RedrawRequested(_) => (),
             Event::LoopDestroyed => {
                 info!("Event loop destroyed.");
+                if let Some(handle) = HOOK_HANDLE.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    unsafe { let _ = UnhookWindowsHookEx(HHOOK(handle as *mut std::ffi::c_void)); }
+                    info!("Low-level keyboard hook removed.");
+                }
             }
             Event::UserEvent(custom_event) => {
                 match custom_event {
@@ -219,6 +245,14 @@ fn main() -> Result<()> {
                         } else {
                             warn!("Received unknown hotkey ID via UserEvent: {}", id);
                         }
+                    }
+                    CustomEvent::PrevDesktop => {
+                        info!("Ctrl+Win+Left pressed -> switching to previous desktop (wrapping).");
+                        handle_switch_wrapping(-1, &last_active_windows_map_for_loop);
+                    }
+                    CustomEvent::NextDesktop => {
+                        info!("Ctrl+Win+Right pressed -> switching to next desktop (wrapping).");
+                        handle_switch_wrapping(1, &last_active_windows_map_for_loop);
                     }
                 }
             }
@@ -303,6 +337,29 @@ fn number_to_code(num: u32) -> Result<Code> {
         7 => Ok(Code::Digit7), 8 => Ok(Code::Digit8), 9 => Ok(Code::Digit9),
         0 => Ok(Code::Digit0),
         _ => Err(anyhow::anyhow!("Number out of range for hotkey code")),
+    }
+}
+
+fn handle_switch_wrapping(direction: i64, last_active_map: &LastActiveWindowMap) {
+    match winvd::get_current_desktop() {
+        Ok(d) => {
+            if let Ok(idx) = d.get_index() {
+                let current = idx as i64;
+                let count = get_desktop_count().unwrap_or(1) as i64;
+                if count <= 1 {
+                    return;
+                }
+                let mut target = current + direction;
+                if target < 0 {
+                    target = count - 1;
+                }
+                if target >= count {
+                    target = 0;
+                }
+                handle_switch_to_desktop(target as usize, last_active_map);
+            }
+        }
+        Err(e) => error!("Could not get current desktop for wrapped switch: {:?}", e),
     }
 }
 
@@ -550,10 +607,92 @@ fn handle_move_window_to_desktop(target_desktop_idx_0_based: usize) {
     }
 }
 
+fn setup_low_level_keyboard_hook(proxy: EventLoopProxy<CustomEvent>) -> Result<()> {
+    {
+        let mut guard = EVENT_PROXY.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(proxy);
+    }
+
+    unsafe {
+        // LL hooks are invoked newest-first. Explorer re-registers its own hook
+        // (e.g. on shell restart), which would beat ours. Re-register periodically
+        // so our hook always stays ahead of Explorer's.
+        loop {
+            let hook = SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(low_level_keyboard_proc),
+                HINSTANCE(std::ptr::null_mut()),
+                0,
+            )
+            .context("Failed to install low-level keyboard hook (WH_KEYBOARD_LL)")?;
+
+            {
+                let mut guard = HOOK_HANDLE.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = Some(hook.0 as usize);
+            }
+
+            info!("Low-level keyboard hook (re)installed. Ctrl+Win+Left/Right overridden.");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        return Ok(());
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            {
+                let mut guard = HOOK_HANDLE.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = None;
+            }
+            let _ = UnhookWindowsHookEx(HHOOK(hook.0));
+        }
+    }
+}
+
+unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        let vk = kb.vkCode;
+
+        let ctrl_down = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+        let win_down = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } as u16 & 0x8000) != 0
+            || (unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } as u16 & 0x8000) != 0;
+
+        let is_arrow = vk == VK_LEFT.0 as u32 || vk == VK_RIGHT.0 as u32;
+        let msg = wparam.0 as u32;
+        let is_key_msg = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP;
+
+        if is_arrow && ctrl_down && win_down && is_key_msg {
+            if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+                let was_active = SWALLOW_ACTIVE.swap(true, Ordering::SeqCst);
+                if !was_active {
+                    let event = if vk == VK_LEFT.0 as u32 { CustomEvent::PrevDesktop } else { CustomEvent::NextDesktop };
+                    if let Some(proxy) = EVENT_PROXY.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                        info!("Sending {:?} to event loop.", event);
+                        let _ = proxy.send_event(event);
+                    }
+                }
+            } else {
+                SWALLOW_ACTIVE.store(false, Ordering::SeqCst);
+            }
+            return LRESULT(1);
+        }
+    }
+
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
 fn show_about_dialog() {
     let message = format!(
         "{}\nVersion: {}\n\n\
-        Allows switching virtual desktops 1-10 using RCtrl + <Number> (RCtrl+0 for Desktop 10).\n\n\
+        Allows switching virtual desktops 1-10 using RCtrl + <Number> (RCtrl+0 for Desktop 10).\n\
+        As well as switching to the next and previous desktop via Ctrl + Win + Left/Right Arrow, overriding Windows' default behavior (sluggish animation when animations are on).\n\n\
         Author: Joona Kulmala <jmkulmala@gmail.com>.",
         APP_NAME,
         env!("CARGO_PKG_VERSION")
