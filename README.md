@@ -63,7 +63,7 @@ DeskHopper is a lightweight, background utility for Windows 10/11 that enhances 
 * **Next / Previous Desktop**: `Ctrl + Win + Left/Right Arrow` — overrides Windows' default hotkey for an instant switch without the sluggish animation. Wraps around at the first/last desktop.
 * **Move Window to Next / Previous Desktop**: `Ctrl + Alt + Left/Right Arrow` — moves the focused window to the previous/next desktop (wraps around).
 
-### Running at Startup (Recommended)
+### Running at Startup (can have edge cases for the low-level hook for Shift+Win+Left/Right in certain conditions not working, like when Task Manager is focused)
 
 To have DeskHopper start automatically when Windows boots up:
 
@@ -89,7 +89,7 @@ schtasks /create /tn "DeskHopper" /tr "C:\full\path\to\deskhopper.exe" /sc onlog
 1.  `Win + R` → `taskschd.msc`
 2.  Task Scheduler Library → right-click → **Create Task**
 3.  **General** tab: give it a name and check **Run with highest privileges**
-4.  **Triggers** tab → New → Begin the task: **At log on** → select **Any user** (or your user for this user only)
+4. **Triggers** tab → New → Begin the task: **At log on** → select **Any user** (or your user for this user only). Set a delay of around `5 seconds` so the tray icon can be created and the program does not try to create the tray icon before the taskbar is initialized.
 5.  **Actions** tab → New → Start a program → browse to `deskhopper.exe`, and set **Start in (optional)** to the folder containing `deskhopper.exe` (its working directory)
 6.  **Conditions** tab → uncheck **Start the task only if the computer is on AC power** and **Stop if the computer switches to battery power**
 7.  OK (answer the UAC prompt once)
